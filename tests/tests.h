@@ -118,6 +118,13 @@ void selfcheck_board_matches_table(void **state);
 /* file_lock.c */
 int file_lock_test_teardown(void **state);
 void file_lock_acquire_release_test_success(void **state);
+void file_lock_create_and_race_open_test_success(void **state);
+void file_lock_fchmod_ownership_test_success(void **state);
+void file_lock_rejects_non_regular_file_test_success(void **state);
+void file_lock_rejects_invalid_nlink_test_success(void **state);
+void file_lock_rejects_fstat_failure_test_success(void **state);
+void file_lock_fallback_dir_test_success(void **state);
+void file_lock_rejects_invalid_args_test_success(void **state);
 void file_lock_timeout_reports_holder_test_success(void **state);
 void file_lock_timeout_fallback_pid_test_success(void **state);
 void file_lock_timeout_edge_cases_test_success(void **state);

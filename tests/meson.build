@@ -73,6 +73,7 @@ mocks = [
   '-Wl,--wrap=feof',
   '-Wl,--wrap=ferror',
   '-Wl,--wrap=flock',
+  '-Wl,--wrap=fchmod',
   '-Wl,--wrap=ftruncate',
   '-Wl,--wrap=clearerr',
   '-Wl,--wrap=setvbuf',

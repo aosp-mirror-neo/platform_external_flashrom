@@ -17,6 +17,7 @@
 #define WRAPS_H
 
 #include <stdio.h>
+#include <sys/types.h>
 #include "flash.h"
 
 struct programmer_cfg; /* defined in programmer.h */
@@ -65,6 +66,7 @@ int __real_fclose(FILE *fp);
 int __wrap_feof(FILE *fp);
 int __wrap_ferror(FILE *fp);
 int __wrap_flock(int fd, int operation);
+int __wrap_fchmod(int fd, mode_t mode);
 int __wrap_ftruncate(int fd, off_t length);
 void __wrap_clearerr(FILE *fp);
 int __wrap_rget_io_perms(void);
