@@ -115,4 +115,11 @@ void selfcheck_flashchips_table(void **state);
 void selfcheck_eraseblocks(void **state);
 void selfcheck_board_matches_table(void **state);
 
+/* file_lock.c */
+int file_lock_test_teardown(void **state);
+void file_lock_acquire_release_test_success(void **state);
+void file_lock_timeout_reports_holder_test_success(void **state);
+void file_lock_timeout_fallback_pid_test_success(void **state);
+void file_lock_timeout_edge_cases_test_success(void **state);
+
 #endif /* TESTS_H */

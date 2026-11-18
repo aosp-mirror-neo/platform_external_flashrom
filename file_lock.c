@@ -42,10 +42,12 @@
  * The current process's PID will be written to the file for debug purposes.
  */
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +56,9 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
 
 #include "flash.h"
 #include "ipc_lock.h"
@@ -213,33 +218,279 @@ static int file_lock_write_pid(struct ipc_lock *lock)
 	return 0;
 }
 
+static bool read_lockfile_pid(int fd, long *pid_out)
+{
+	char buf[32] = {0};
+	ssize_t n;
+	char *end;
+	long pid;
+
+	if (fd < 0)
+		return false;
+
+	(void)lseek(fd, 0, SEEK_SET);
+	do {
+		n = read(fd, buf, sizeof(buf) - 1);
+	} while (n < 0 && errno == EINTR);
+	if (n <= 0)
+		return false;
+	buf[n] = '\0';
+
+	if (!isdigit((unsigned char)buf[0]))
+		return false;
+
+	errno = 0;
+	pid = strtol(buf, &end, 10);
+	if (errno != 0 || end == buf || pid <= 0)
+		return false;
+
+	while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')
+		end++;
+	if (*end != '\0')
+		return false;
+
+	*pid_out = pid;
+	return true;
+}
+
+#ifdef __linux__
+static bool next_token(const char **cursor, const char **tok_start, size_t *tok_len)
+{
+	const char *p = *cursor;
+
+	while (*p == ' ' || *p == '\t')
+		p++;
+
+	if (*p == '\0' || *p == '\n' || *p == '\r') {
+		*cursor = p;
+		return false;
+	}
+
+	*tok_start = p;
+	while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+		p++;
+
+	*tok_len = (size_t)(p - *tok_start);
+	*cursor = p;
+	return true;
+}
+
+/*
+ * Parse a single line from Linux /proc/locks of the form:
+ *   <id>: FLOCK  ADVISORY  WRITE <pid> <maj_hex>:<min_hex>:<ino_dec> <start> <end>
+ * Blocked waiters contain "->" after "<id>:" and are ignored.
+ */
+static bool parse_proc_locks_line(const char *line, unsigned int target_maj,
+				  unsigned int target_min, uintmax_t target_ino,
+				  long *pid_out)
+{
+	const char *p = line;
+	const char *tok;
+	size_t tok_len;
+	char pid_buf[32];
+	char dev_ino_buf[64];
+	char *end;
+	long pid;
+	unsigned long dev_maj;
+	unsigned long dev_min;
+	unsigned long long ino;
+
+	/* Skip leading whitespace and the "<id>:" prefix. */
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (!isdigit((unsigned char)*p))
+		return false;
+	while (isdigit((unsigned char)*p))
+		p++;
+	if (*p != ':')
+		return false;
+	p++;
+
+	/* Field 1: lock type (must be "FLOCK"; ignores blocked waiters "->"). */
+	if (!next_token(&p, &tok, &tok_len) ||
+	    tok_len != 5 || memcmp(tok, "FLOCK", 5) != 0)
+		return false;
+
+	/* Field 2: mode (e.g. ADVISORY). */
+	if (!next_token(&p, &tok, &tok_len))
+		return false;
+
+	/* Field 3: access (e.g. READ, WRITE). */
+	if (!next_token(&p, &tok, &tok_len))
+		return false;
+
+	/* Field 4: PID. */
+	if (!next_token(&p, &tok, &tok_len) || tok_len >= sizeof(pid_buf))
+		return false;
+	memcpy(pid_buf, tok, tok_len);
+	pid_buf[tok_len] = '\0';
+
+	errno = 0;
+	pid = strtol(pid_buf, &end, 10);
+	if (errno != 0 || end == pid_buf || *end != '\0')
+		return false;
+
+	/* Field 5: "<maj_hex>:<min_hex>:<ino_dec>". */
+	if (!next_token(&p, &tok, &tok_len) || tok_len >= sizeof(dev_ino_buf))
+		return false;
+	memcpy(dev_ino_buf, tok, tok_len);
+	dev_ino_buf[tok_len] = '\0';
+
+	const char *s = dev_ino_buf;
+	if (!isxdigit((unsigned char)*s))
+		return false;
+	errno = 0;
+	dev_maj = strtoul(s, &end, 16);
+	if (errno != 0 || end == s || *end != ':' || dev_maj > UINT_MAX)
+		return false;
+
+	s = end + 1;
+	if (!isxdigit((unsigned char)*s))
+		return false;
+	errno = 0;
+	dev_min = strtoul(s, &end, 16);
+	if (errno != 0 || end == s || *end != ':' || dev_min > UINT_MAX)
+		return false;
+
+	s = end + 1;
+	if (!isdigit((unsigned char)*s))
+		return false;
+	errno = 0;
+	ino = strtoull(s, &end, 10);
+	if (errno != 0 || end == s || *end != '\0')
+		return false;
+
+	if ((unsigned int)dev_maj != target_maj ||
+	    (unsigned int)dev_min != target_min ||
+	    (uintmax_t)ino != target_ino)
+		return false;
+
+	*pid_out = pid;
+	return true;
+}
+
+static void read_proc_comm(long pid, char *comm, size_t comm_size)
+{
+	char proc_path[64];
+	FILE *fp;
+	int ret;
+
+	if (comm_size == 0 || comm_size > INT_MAX)
+		return;
+	comm[0] = '\0';
+
+	if (pid <= 0)
+		return;
+
+	ret = snprintf(proc_path, sizeof(proc_path), "/proc/%ld/comm", pid);
+	if (ret < 0 || (size_t)ret >= sizeof(proc_path))
+		return;
+
+	fp = fopen(proc_path, "r");
+	if (!fp)
+		return;
+
+	if (fgets(comm, (int)comm_size, fp) != NULL) {
+		size_t len = strlen(comm);
+		if (len > 0 && comm[len - 1] == '\n')
+			comm[--len] = '\0';
+		/* Replace non-printable characters before logging. */
+		for (size_t i = 0; i < len; i++) {
+			if (!isprint((unsigned char)comm[i]))
+				comm[i] = '?';
+		}
+	} else {
+		comm[0] = '\0';
+	}
+
+	fclose(fp);
+}
+
+static bool report_lock_holder_from_proc_locks(int fd)
+{
+	struct stat st = {0};
+	FILE *fp;
+	char line[256];
+	bool skip_long_line = false;
+	bool found = false;
+
+	if (fstat(fd, &st) < 0) {
+		msg_gdbg("Could not stat lockfile to determine lock holder: %s\n",
+			 strerror(errno));
+		return false;
+	}
+
+	fp = fopen("/proc/locks", "r");
+	if (!fp) {
+		msg_gdbg("Could not open /proc/locks to determine lock holder: %s\n",
+			 strerror(errno));
+		return false;
+	}
+
+	unsigned int target_maj = major(st.st_dev);
+	unsigned int target_min = minor(st.st_dev);
+	uintmax_t target_ino = (uintmax_t)st.st_ino;
+
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		size_t len = strlen(line);
+		bool has_newline = (len > 0 && line[len - 1] == '\n');
+
+		if (skip_long_line) {
+			if (has_newline)
+				skip_long_line = false;
+			continue;
+		}
+		if (len == sizeof(line) - 1 && !has_newline) {
+			skip_long_line = true;
+			continue;
+		}
+
+		long pid = 0;
+		if (!parse_proc_locks_line(line, target_maj, target_min, target_ino, &pid))
+			continue;
+
+		found = true;
+		if (pid > 0) {
+			char comm[64];
+			read_proc_comm(pid, comm, sizeof(comm));
+			if (comm[0] != '\0')
+				msg_gerr("Lock is held by PID %ld (%s).\n", pid, comm);
+			else
+				msg_gerr("Lock is held by PID %ld.\n", pid);
+		} else {
+			msg_gerr("Lock is held by another process (PID unavailable).\n");
+		}
+	}
+
+	fclose(fp);
+	return found;
+}
+#else
+static bool report_lock_holder_from_proc_locks(int fd)
+{
+	(void)fd;
+	return false;
+}
+#endif
+
 static void report_lock_holder(struct ipc_lock *lock)
 {
-	FILE *lsof_pipe;
-	char lsof_cmd[PATH_MAX + 64];
-	char proc_path[PATH_MAX] = {0};
-	char lock_path[PATH_MAX] = {0};
-	char lsof_output[1024];
+	long pid = 0;
 
-	/* We need the full path to the lock file for lsof. */
-	snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", lock->fd);
-	if (readlink(proc_path, lock_path, sizeof(lock_path) - 1) <= 0) {
-		msg_gerr("Could not determine full lock file path.\n");
+	if (report_lock_holder_from_proc_locks(lock->fd))
+		return;
+
+	/*
+	 * Fall back to reading the PID written by file_lock_write_pid() when
+	 * /proc/locks is unreadable (e.g., restricted by SELinux) or omits
+	 * locks held outside the current PID namespace.
+	 */
+	if (read_lockfile_pid(lock->fd, &pid)) {
+		msg_gerr("Lock is held by PID %ld (from lockfile).\n", pid);
 		return;
 	}
 
-	snprintf(lsof_cmd, sizeof(lsof_cmd), "lsof '%s'", lock_path);
-	msg_ginfo("Finding lock holder with '%s'.\n", lsof_cmd);
-	lsof_pipe = popen(lsof_cmd, "r");
-	if (!lsof_pipe) {
-		msg_gerr("Failed to run '%s'.\n", lsof_cmd);
-		return;
-	}
-
-	while (fgets(lsof_output, sizeof(lsof_output), lsof_pipe))
-		msg_gerr("%s", lsof_output);
-
-	pclose(lsof_pipe);
+	msg_gerr("Could not determine lock holder.\n");
 }
 
 static void file_lock_release(struct ipc_lock *lock)
