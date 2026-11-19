@@ -81,6 +81,7 @@ void region_not_included_overlap_test_success(void **state);
 void layout_pass_sanity_checks_test_success(void **state);
 void layout_region_invalid_address_test_success(void **state);
 void layout_region_invalid_range_test_success(void **state);
+void cros_ec_parse_layout_test_success(void **state);
 
 /* chip.c */
 void erase_chip_test_success(void **state);

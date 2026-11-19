@@ -609,28 +609,48 @@ static void parse_fmap(struct flashctx *flash, const uint8_t *const image,
 	free(fmap);
 }
 
-/**
- * iff layout region is one of the supported cros_ec
- * sections then modify the region_type bit-feild.
- * 00 - no RO or RW.
- * 01 - RO found.
- * 10 - RW found.
- * 11 - RO+RW found.
- */
-static enum ec_current_image parse_layout(const struct flashrom_layout *const layout)
+static bool region_overlaps(const struct flash_region *const region,
+			    const struct ec_response_flash_region_info *const info)
 {
-	enum ec_current_image region_type = EC_IMAGE_UNKNOWN; /* no RO or RW found yet. */
+	if (!info || info->size == 0)
+		return false;
+	return (uint64_t)region->start < (uint64_t)info->offset + info->size &&
+	       (uint64_t)region->end >= info->offset;
+}
+
+/**
+ * Determine which EC firmware image copies (EC_IMAGE_RO / EC_IMAGE_RW)
+ * overlap the included regions in layout.
+ * 00 - included region(s) overlap neither EC_FLASH_REGION_RO nor active
+ *      EC_FLASH_REGION_RW (e.g. dedicated PSTATE bank, ROLLBACK, or
+ *      inactive RW slot).
+ * 01 - included region(s) overlap EC_FLASH_REGION_RO only (e.g. WP_RO,
+ *      EC_RO, RO_FRID, CBI).
+ * 10 - included region(s) overlap active EC_FLASH_REGION_RW only (e.g.
+ *      EC_RW, RW_FWID).
+ * 11 - full image or included regions overlap both RO and active RW.
+ */
+int cros_ec_parse_layout(const struct flashrom_layout *const layout,
+			 const struct ec_response_flash_region_info *const ro_region,
+			 const struct ec_response_flash_region_info *const rw_region)
+{
+	int region_type = EC_IMAGE_UNKNOWN;
 	const struct romentry *entry = NULL;
+	bool has_included = false;
+
+	if (!layout || !ro_region || !rw_region)
+		return EC_IMAGE_RO | EC_IMAGE_RW;
 
 	while ((entry = layout_next_included(layout, entry))) {
 		const struct flash_region *region = &entry->region;
-		if (!strcmp("WP_RO", (const char *) region->name))
+		has_included = true;
+		if (region_overlaps(region, ro_region))
 			region_type |= EC_IMAGE_RO;
-		if (!strcmp(sections[EC_IMAGE_RW], (const char *) region->name))
+		if (region_overlaps(region, rw_region))
 			region_type |= EC_IMAGE_RW;
 	}
-	/* iff neither RO or RW was found in the layout then assume a full image of both. */
-	return region_type == EC_IMAGE_UNKNOWN ? (EC_IMAGE_RO | EC_IMAGE_RW) : region_type;
+	/* If no regions were included in the layout, assume a full image of both. */
+	return has_included ? region_type : (EC_IMAGE_RO | EC_IMAGE_RW);
 }
 
 /*
@@ -653,9 +673,13 @@ int cros_ec_prepare(struct flashctx *flash, const uint8_t *const image, uint32_t
 		return 1;
 
 	parse_fmap(flash, image, flash_size);
+	if (!cros_ec_dev_priv.region)
+		return 1;
 	/* check layout to determine what sysjumps we are required to do. */
 	const struct flashrom_layout *const layout = get_layout(flash);
-	const enum ec_current_image region_typ = parse_layout(layout);
+	const int region_typ = cros_ec_parse_layout(
+		layout, &cros_ec_dev_priv.region[EC_IMAGE_RO],
+		&cros_ec_dev_priv.region[EC_IMAGE_RW]);
 
 	if (ec_check_features(EC_FEATURE_EXEC_IN_RAM) <= 0) {
 		/* Warning: before update, we jump the EC to RO copy. If you
@@ -664,6 +688,10 @@ int cros_ec_prepare(struct flashctx *flash, const uint8_t *const image, uint32_t
 		 */
 		msg_pwarn("EXEC_IN_RAM unsupported..");
 
+		if (region_typ == EC_IMAGE_UNKNOWN) {
+			msg_pwarn(" layout overlaps neither RO nor active RW, skipping jump.\n");
+			return 0;
+		}
 		if (!(region_typ & EC_IMAGE_RO) && cros_ec_get_current_image() == EC_IMAGE_RO) {
 			msg_pwarn(" image contains RW and already in RO, skipping jump.\n");
 			return 0;

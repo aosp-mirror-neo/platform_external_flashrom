@@ -505,6 +505,7 @@ int main(int argc, char *argv[])
 		cmocka_unit_test(layout_pass_sanity_checks_test_success),
 		cmocka_unit_test(layout_region_invalid_address_test_success),
 		cmocka_unit_test(layout_region_invalid_range_test_success),
+		cmocka_unit_test(cros_ec_parse_layout_test_success),
 	};
 	ret |= cmocka_run_group_tests_name("layout.c tests", layout_tests, NULL, NULL);
 

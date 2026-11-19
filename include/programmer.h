@@ -483,6 +483,8 @@ typedef int fdtype;
 #endif
 
 /* cros_ec.c */
+struct ec_response_flash_region_info;
+struct flashrom_layout;
 /**
  * Probe the Google Chrome OS EC device
  *
@@ -491,6 +493,9 @@ typedef int fdtype;
 int cros_ec_need_2nd_pass(void);
 bool cros_ec_erasure_failed(void);
 int cros_ec_finish(void);
+int cros_ec_parse_layout(const struct flashrom_layout *layout,
+			 const struct ec_response_flash_region_info *ro_region,
+			 const struct ec_response_flash_region_info *rw_region);
 int cros_ec_prepare(struct flashctx *flash, const uint8_t *const image, uint32_t flash_size);
 int cros_ec_block_erase(struct flashctx *flash, unsigned int blockaddr, unsigned int len);
 
