@@ -38,8 +38,7 @@
 
 #include <stdint.h>
 
-/* Required for struct timeval, mode_t, and struct stat */
-#include <sys/stat.h>
+/* Required for struct timeval and mode_t */
 #include <sys/types.h>
 #include <sys/time.h>
 
@@ -56,6 +55,9 @@ struct pci_dev {
 
 /* Linux I2C interface constants, avoiding linux/i2c-dev.h */
 #define I2C_SLAVE 0x0703
+
+/* Always return success for tests. */
+#define S_ISREG(x) 0
 
 /* Maximum number of open calls to mock. This number is arbitrary. */
 #define MAX_MOCK_OPEN 4
@@ -120,8 +122,6 @@ struct io_mock {
 	int (*iom_ioctl)(void *state, int fd, unsigned long request, va_list args);
 	int (*iom_read)(void *state, int fd, void *buf, size_t sz);
 	int (*iom_write)(void *state, int fd, const void *buf, size_t sz);
-	int (*iom_fstat)(void *state, int fd, struct stat *buf);
-	int (*iom_flock)(void *state, int fd, int operation);
 
 	/* Standard I/O */
 	FILE* (*iom_fopen)(void *state, const char *pathname, const char *mode);

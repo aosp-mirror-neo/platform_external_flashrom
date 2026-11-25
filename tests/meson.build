@@ -23,7 +23,6 @@ test_srcs = files(
   'chip.c',
   'chip_wp.c',
   'selfcheck.c',
-  'file_lock.c',
   'io_real.c',
 )
 

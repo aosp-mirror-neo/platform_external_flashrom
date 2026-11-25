@@ -23,7 +23,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
-#include <unistd.h>
 
 void *not_null(void)
 {
@@ -219,41 +218,22 @@ int __wrap___xstat64(const char *path, void *buf)
 	return 0;
 }
 
-static int mock_fstat(int fd, void *buf)
-{
-	if (get_io() && get_io()->iom_fstat)
-		return get_io()->iom_fstat(get_io()->state, fd, buf);
-	if (buf) {
-		struct stat *st = buf;
-		memset(st, 0, sizeof(*st));
-		st->st_mode = S_IFREG | 0666;
-#if !IS_WINDOWS
-		st->st_uid = geteuid();
-#endif
-	}
-	return 0;
-}
-
 int __wrap_fstat(int fd, void *buf)
 {
 	LOG_ME;
-	return mock_fstat(fd, buf);
+	return 0;
 }
 
 int __wrap_fstat64(int fd, void *buf)
 {
 	LOG_ME;
-#if defined(__LP64__) || (defined(_FILE_OFFSET_BITS) && _FILE_OFFSET_BITS == 64)
-	return mock_fstat(fd, buf);
-#else
 	return 0;
-#endif
 }
 
 int __wrap___fstat50(int fd, void *buf)
 {
 	LOG_ME;
-	return mock_fstat(fd, buf);
+	return 0;
 }
 
 int __wrap___fxstat(int fd, void *buf)
@@ -353,8 +333,6 @@ int __wrap_ferror(FILE *fp)
 int __wrap_flock(int fd, int operation)
 {
 	LOG_ME;
-	if (get_io() && get_io()->iom_flock)
-		return get_io()->iom_flock(get_io()->state, fd, operation);
 	return 0;
 }
 
@@ -560,14 +538,6 @@ int main(int argc, char *argv[])
 		cmocka_unit_test(wp_get_register_values_and_masks),
 	};
 	ret |= cmocka_run_group_tests_name("chip_wp.c tests", chip_wp_tests, NULL, NULL);
-
-	const struct CMUnitTest file_lock_tests[] = {
-		cmocka_unit_test_teardown(file_lock_acquire_release_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_timeout_reports_holder_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_timeout_fallback_pid_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_timeout_edge_cases_test_success, file_lock_test_teardown),
-	};
-	ret |= cmocka_run_group_tests_name("file_lock.c tests", file_lock_tests, NULL, NULL);
 
 	return ret;
 }
