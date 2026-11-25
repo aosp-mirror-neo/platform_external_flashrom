@@ -122,7 +122,6 @@ struct io_mock {
 	int (*iom_write)(void *state, int fd, const void *buf, size_t sz);
 	int (*iom_fstat)(void *state, int fd, struct stat *buf);
 	int (*iom_flock)(void *state, int fd, int operation);
-	int (*iom_fchmod)(void *state, int fd, mode_t mode);
 
 	/* Standard I/O */
 	FILE* (*iom_fopen)(void *state, const char *pathname, const char *mode);

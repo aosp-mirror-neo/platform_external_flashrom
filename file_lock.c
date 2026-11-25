@@ -78,7 +78,7 @@ static int lock_is_held(struct ipc_lock *lock)
 
 static int test_dir(const char *path)
 {
-	struct stat s = {0};
+	struct stat s;
 
 	if (lstat(path, &s) < 0) {
 		msg_gerr("Cannot stat %s.\n", path);
@@ -93,102 +93,28 @@ static int test_dir(const char *path)
 	return 0;
 }
 
-enum file_lock_open_result {
-	FILE_LOCK_OPEN_OK = 0,
-	FILE_LOCK_OPEN_CAN_FALLBACK = 1,
-	FILE_LOCK_OPEN_ERROR = -1,
-};
-
-static int file_lock_open_fd(const char *path, mode_t permissions, bool *can_fallback)
-{
-	int open_flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
-	int fd;
-
-	*can_fallback = false;
-
-	/*
-	 * Try opening an existing lockfile without O_CREAT first so hosts
-	 * with fs.protected_regular enabled do not reject existing non-owned
-	 * files in sticky directories (e.g., 01777 /run/lock) with EACCES.
-	 */
-	fd = open(path, open_flags);
-	if (fd < 0 && errno == ENOENT) {
-		fd = open(path, open_flags | O_CREAT | O_EXCL, permissions);
-		if (fd < 0) {
-			if (errno == EEXIST) {
-				fd = open(path, open_flags);
-			} else {
-				/* No lockfile exists here and none could be created. */
-				*can_fallback = true;
-			}
-		}
-	}
-	return fd;
-}
-
-static enum file_lock_open_result file_lock_try_open_or_create(const char *dir, struct ipc_lock *lock)
+static int file_lock_try_open_or_create(const char *dir, struct ipc_lock *lock)
 {
 	char path[PATH_MAX];
-	struct stat st = {0};
-	bool can_fallback = false;
-	int ret;
-
-	if (!lock || !lock->filename || lock->filename[0] == '\0')
-		return FILE_LOCK_OPEN_ERROR;
-
 	if (test_dir(dir))
-		return FILE_LOCK_OPEN_CAN_FALLBACK;
+		return -1;
 
-	ret = snprintf(path, sizeof(path), "%s/%s", dir, lock->filename);
-	if (ret < 0 || (size_t)ret >= sizeof(path)) {
-		msg_gerr("Lockfile path too long: %s/%s\n", dir, lock->filename);
-		return FILE_LOCK_OPEN_ERROR;
-	}
+	if (snprintf(path, sizeof(path), "%s/%s", dir, lock->filename) < 0)
+		return -1;
 
 	/* 0666: User/Group/Others: read, write. */
 	mode_t permissions = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-	lock->fd = file_lock_open_fd(path, permissions, &can_fallback);
+	lock->fd = open(path, O_RDWR | O_CREAT, permissions);
 	if (lock->fd < 0) {
-		msg_gerr("Cannot open lockfile %s: %s\n", path, strerror(errno));
-		return can_fallback ? FILE_LOCK_OPEN_CAN_FALLBACK : FILE_LOCK_OPEN_ERROR;
+		msg_gerr("Cannot open lockfile %s\n", path);
+		return -1;
 	}
-
-	if (fstat(lock->fd, &st) < 0) {
-		msg_gerr("Cannot stat lockfile %s: %s\n", path, strerror(errno));
-		close(lock->fd);
-		lock->fd = -1;
-		return FILE_LOCK_OPEN_ERROR;
-	}
-
-	if (!S_ISREG(st.st_mode)) {
-		msg_gerr("Lockfile %s is not a regular file.\n", path);
-		close(lock->fd);
-		lock->fd = -1;
-		return FILE_LOCK_OPEN_ERROR;
-	}
-
-	if (st.st_nlink != 1) {
-		msg_gerr("Lockfile %s has unexpected link count (%ju).\n",
-			 path, (uintmax_t)st.st_nlink);
-		close(lock->fd);
-		lock->fd = -1;
-		return FILE_LOCK_OPEN_ERROR;
-	}
-
-	/*
-	 * Only change permissions if we own the lockfile. Non-owned lockfiles
-	 * are still accepted so non-root services (e.g., minios) and users can
-	 * share the lockfile with root. Ignore potential fchmod() failures
-	 * since this is best-effort for multi-user access.
-	 */
-	if (st.st_uid == geteuid() &&
-	    (st.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO)) != permissions) {
-		if (fchmod(lock->fd, permissions) == -1)
-			msg_gdbg("Cannot change the permissions of lockfile %s\n", path);
-	}
+	/* Ignore potential fchmod() failures since we might not be the owner. */
+	if (fchmod(lock->fd, permissions) == -1)
+		msg_gdbg("Cannot change the permissions of lockfile %s\n", path);
 
 	msg_gdbg("Opened file lock \"%s\"\n", path);
-	return FILE_LOCK_OPEN_OK;
+	return 0;
 }
 
 static int file_lock_open_or_create(struct ipc_lock *lock)
@@ -207,29 +133,13 @@ static int file_lock_open_or_create(struct ipc_lock *lock)
 #endif
 	};
 
-	enum file_lock_open_result res = file_lock_try_open_or_create(dirs[0], lock);
-	if (res == FILE_LOCK_OPEN_OK)
+	if (file_lock_try_open_or_create(dirs[0], lock) == 0)
 		return 0;
-
-#ifndef __ANDROID__
-	/*
-	 * Only fall back to /tmp if the primary directory has no lockfile and
-	 * none can be created there; otherwise return an error so callers do
-	 * not split locks across separate files.
-	 */
-	if (res != FILE_LOCK_OPEN_CAN_FALLBACK)
-		return -1;
-#endif
 
 	for (size_t i = 1; i < ARRAY_SIZE(dirs); ++i) {
 		msg_gwarn("Trying fallback directory: %s\n", dirs[i]);
-		res = file_lock_try_open_or_create(dirs[i], lock);
-		if (res == FILE_LOCK_OPEN_OK)
+		if (file_lock_try_open_or_create(dirs[i], lock) == 0)
 			return 0;
-#ifndef __ANDROID__
-		if (res != FILE_LOCK_OPEN_CAN_FALLBACK)
-			return -1;
-#endif
 	}
 
 	msg_gerr("Failed to find usable directory for file lock\n");
@@ -289,22 +199,18 @@ static int file_lock_get(struct ipc_lock *lock, int timeout_msecs)
 static int file_lock_write_pid(struct ipc_lock *lock)
 {
 	ssize_t len;
-	char pid_str[32];
-	int ret;
+	/* PIDs are usually 5 digits, but we'll reserve enough room for
+	   a value of 2^32 (10 digits) out of paranoia. */
+	char pid_str[11];
 
 	if (ftruncate(lock->fd, 0) < 0) {
 		msg_gerr("Cannot truncate lockfile\n");
 		return -1;
 	}
 
-	ret = snprintf(pid_str, sizeof(pid_str), "%lu", (unsigned long)getpid());
-	if (ret < 0 || (size_t)ret >= sizeof(pid_str)) {
-		msg_gerr("Cannot format PID for lockfile\n");
-		return -1;
-	}
-
-	len = write(lock->fd, pid_str, (size_t)ret);
-	if (len != (ssize_t)ret) {
+	snprintf(pid_str, sizeof(pid_str), "%lu", (unsigned long)getpid());
+	len = write(lock->fd, pid_str, strlen(pid_str));
+	if (len < 0) {
 		msg_gerr("Cannot write PID to lockfile\n");
 		return -1;
 	}
@@ -594,8 +500,6 @@ static void file_lock_release(struct ipc_lock *lock)
 
 	if (close(lock->fd) < 0)
 		msg_gerr("Cannot close lockfile\n");
-
-	lock->fd = -1;
 }
 
 /*
@@ -609,9 +513,6 @@ static void file_lock_release(struct ipc_lock *lock)
  */
 int acquire_lock(struct ipc_lock *lock, int timeout_msecs)
 {
-	if (!lock || !lock->filename || lock->filename[0] == '\0')
-		return -1;
-
 	/* check if it is already held */
 	if (lock_is_held(lock))
 		return 1;
@@ -625,7 +526,6 @@ int acquire_lock(struct ipc_lock *lock, int timeout_msecs)
 
 		lock->is_held = 0;
 		close(lock->fd);
-		lock->fd = -1;
 		return -1;
 	} else {
 		lock->is_held = 1;
@@ -648,9 +548,6 @@ int acquire_lock(struct ipc_lock *lock, int timeout_msecs)
  */
 int release_lock(struct ipc_lock *lock)
 {
-	if (!lock)
-		return -1;
-
 	if (lock_is_held(lock)) {
 		file_lock_release(lock);
 		lock->is_held = 0;
@@ -658,6 +555,6 @@ int release_lock(struct ipc_lock *lock)
 	}
 
 	msg_ginfo("%s called but lock was not held on %s.\n",
-			__func__, lock->filename ? lock->filename : "(null)");
+			__func__, lock->filename);
 	return -1;
 }

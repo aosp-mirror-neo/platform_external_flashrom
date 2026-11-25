@@ -21,7 +21,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,22 +31,12 @@
 #include <sys/sysmacros.h>
 #endif
 
-#define MAX_OPEN_CALLS 8
-
 struct file_lock_test_state {
 	int open_count;
-	char open_path_history[MAX_OPEN_CALLS][64];
-	int open_flags_history[MAX_OPEN_CALLS];
-	mode_t open_mode_history[MAX_OPEN_CALLS];
-	int open_script_len;
-	int open_script_ret[MAX_OPEN_CALLS];
-	int open_script_errno[MAX_OPEN_CALLS];
 	int last_open_flags;
 	int fstat_ret;
 	int fstat_errno;
 	struct stat fstat_buf;
-	int fchmod_count;
-	mode_t last_fchmod_mode;
 	int flock_count;
 	int last_flock_op;
 	int flock_ret;
@@ -83,20 +72,9 @@ int file_lock_test_teardown(void **state)
 static int mock_lock_open(void *state, const char *pathname, int flags, mode_t mode)
 {
 	struct file_lock_test_state *st = state;
-	int idx = st->open_count++;
 
+	st->open_count++;
 	st->last_open_flags = flags;
-	if (idx < MAX_OPEN_CALLS) {
-		snprintf(st->open_path_history[idx], sizeof(st->open_path_history[idx]),
-			 "%s", pathname ? pathname : "");
-		st->open_flags_history[idx] = flags;
-		st->open_mode_history[idx] = mode;
-	}
-	if (idx < st->open_script_len) {
-		if (st->open_script_ret[idx] < 0)
-			errno = st->open_script_errno[idx];
-		return st->open_script_ret[idx];
-	}
 	return MOCK_FD;
 }
 
@@ -110,16 +88,6 @@ static int mock_lock_fstat(void *state, int fd, struct stat *buf)
 		return st->fstat_ret;
 	}
 	*buf = st->fstat_buf;
-	return 0;
-}
-
-static int mock_lock_fchmod(void *state, int fd, mode_t mode)
-{
-	struct file_lock_test_state *st = state;
-
-	assert_int_equal(fd, MOCK_FD);
-	st->fchmod_count++;
-	st->last_fchmod_mode = mode;
 	return 0;
 }
 
@@ -236,7 +204,6 @@ void file_lock_acquire_release_test_success(void **state)
 		.fstat_ret = 0,
 		.fstat_buf = {
 			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
 			.st_uid = geteuid(),
 		},
 		.flock_ret = 0,
@@ -245,7 +212,6 @@ void file_lock_acquire_release_test_success(void **state)
 		.state = &test_state,
 		.iom_open = mock_lock_open,
 		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
 		.iom_flock = mock_lock_flock,
 	};
 
@@ -254,10 +220,6 @@ void file_lock_acquire_release_test_success(void **state)
 	struct ipc_lock lock = LOCKFILE_INIT("firmware_utility_lock");
 	assert_int_equal(acquire_lock(&lock, 0), 0);
 	assert_int_equal(test_state.open_count, 1);
-	assert_int_equal(test_state.last_open_flags & (O_RDWR | O_NOFOLLOW | O_CLOEXEC),
-			 (O_RDWR | O_NOFOLLOW | O_CLOEXEC));
-	assert_int_equal(test_state.last_open_flags & O_CREAT, 0);
-	assert_int_equal(test_state.fchmod_count, 0);
 	assert_int_equal(test_state.last_flock_op, LOCK_EX | LOCK_NB);
 	assert_int_equal(lock.is_held, 1);
 
@@ -268,370 +230,9 @@ void file_lock_acquire_release_test_success(void **state)
 	assert_int_equal(release_lock(&lock), 0);
 	assert_int_equal(test_state.last_flock_op, LOCK_UN);
 	assert_int_equal(lock.is_held, 0);
-	assert_int_equal(lock.fd, -1);
 
 	/* Releasing when not held returns -1. */
 	assert_int_equal(release_lock(&lock), -1);
-}
-
-void file_lock_create_and_race_open_test_success(void **state)
-{
-	(void)state;
-
-	const int base_flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
-	const int create_flags = base_flags | O_CREAT | O_EXCL;
-
-	/*
-	 * Case 1: Lockfile does not exist yet (ENOENT on first open) -> creates
-	 * exclusively with O_CREAT | O_EXCL and mode 0666.
-	 */
-	struct file_lock_test_state create_state = {
-		.open_script_len = 2,
-		.open_script_ret = { -1, MOCK_FD },
-		.open_script_errno = { ENOENT, 0 },
-		.fstat_ret = 0,
-		.fstat_buf = {
-			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
-			.st_uid = geteuid(),
-		},
-		.flock_ret = 0,
-	};
-	const struct io_mock create_mock = {
-		.state = &create_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-	io_mock_register(&create_mock);
-
-	struct ipc_lock lock1 = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock1, 0), 0);
-	assert_int_equal(create_state.open_count, 2);
-	assert_int_equal(create_state.open_flags_history[0] & (base_flags | O_CREAT), base_flags);
-	assert_int_equal(create_state.open_flags_history[1] & create_flags, create_flags);
-	assert_int_equal(create_state.open_mode_history[1], 0666);
-	assert_int_equal(release_lock(&lock1), 0);
-
-	/*
-	 * Case 2: Concurrent creation race (ENOENT on first open, EEXIST on
-	 * O_CREAT | O_EXCL) -> retries opening without O_CREAT.
-	 */
-	struct file_lock_test_state race_state = {
-		.open_script_len = 3,
-		.open_script_ret = { -1, -1, MOCK_FD },
-		.open_script_errno = { ENOENT, EEXIST, 0 },
-		.fstat_ret = 0,
-		.fstat_buf = {
-			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
-			.st_uid = geteuid(),
-		},
-		.flock_ret = 0,
-	};
-	const struct io_mock race_mock = {
-		.state = &race_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-	io_mock_register(&race_mock);
-
-	struct ipc_lock lock2 = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock2, 0), 0);
-	assert_int_equal(race_state.open_count, 3);
-	assert_int_equal(race_state.open_flags_history[0] & (base_flags | O_CREAT), base_flags);
-	assert_int_equal(race_state.open_flags_history[1] & create_flags, create_flags);
-	assert_int_equal(race_state.open_flags_history[2] & (base_flags | O_CREAT), base_flags);
-	assert_int_equal(release_lock(&lock2), 0);
-}
-
-void file_lock_fchmod_ownership_test_success(void **state)
-{
-	(void)state;
-
-	const uid_t my_uid = geteuid();
-	const uid_t other_uid = (my_uid == 0) ? 1000 : 0;
-
-	/* Owned file with restrictive mode (0600) should be fchmod'd to 0666. */
-	struct file_lock_test_state owned_state = {
-		.fstat_ret = 0,
-		.fstat_buf = {
-			.st_mode = S_IFREG | 0600,
-			.st_nlink = 1,
-			.st_uid = my_uid,
-		},
-		.flock_ret = 0,
-	};
-	const struct io_mock owned_mock = {
-		.state = &owned_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-
-	io_mock_register(&owned_mock);
-
-	struct ipc_lock owned_lock = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&owned_lock, 0), 0);
-	assert_int_equal(owned_state.fchmod_count, 1);
-	assert_int_equal(owned_state.last_fchmod_mode, 0666);
-	assert_int_equal(release_lock(&owned_lock), 0);
-
-	/* Foreign-owned file with restrictive mode must NOT be fchmod'd. */
-	struct file_lock_test_state foreign_state = {
-		.fstat_ret = 0,
-		.fstat_buf = {
-			.st_mode = S_IFREG | 0600,
-			.st_nlink = 1,
-			.st_uid = other_uid,
-		},
-		.flock_ret = 0,
-	};
-	const struct io_mock foreign_mock = {
-		.state = &foreign_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-
-	io_mock_register(&foreign_mock);
-
-	struct ipc_lock foreign_lock = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&foreign_lock, 0), 0);
-	assert_int_equal(foreign_state.fchmod_count, 0);
-	assert_int_equal(release_lock(&foreign_lock), 0);
-}
-
-void file_lock_rejects_non_regular_file_test_success(void **state)
-{
-	(void)state;
-
-	struct file_lock_test_state test_state = {
-		.fstat_ret = 0,
-		.fstat_buf = {
-			.st_mode = S_IFIFO | 0666,
-			.st_nlink = 1,
-			.st_uid = geteuid(),
-		},
-		.flock_ret = 0,
-	};
-	const struct io_mock mock_io = {
-		.state = &test_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-
-	io_mock_register(&mock_io);
-
-	struct ipc_lock lock = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock, 0), -1);
-#ifndef __ANDROID__
-	assert_int_equal(test_state.open_count, 1);
-#endif
-	assert_int_equal(test_state.fchmod_count, 0);
-	assert_int_equal(test_state.flock_count, 0);
-	assert_int_equal(lock.is_held, 0);
-	assert_int_equal(lock.fd, -1);
-}
-
-void file_lock_rejects_invalid_nlink_test_success(void **state)
-{
-	(void)state;
-
-	const nlink_t bad_nlinks[] = { 0, 2 };
-	for (size_t i = 0; i < sizeof(bad_nlinks) / sizeof(bad_nlinks[0]); i++) {
-		struct file_lock_test_state test_state = {
-			.fstat_ret = 0,
-			.fstat_buf = {
-				.st_mode = S_IFREG | 0666,
-				.st_nlink = bad_nlinks[i],
-				.st_uid = geteuid(),
-			},
-			.flock_ret = 0,
-		};
-		const struct io_mock mock_io = {
-			.state = &test_state,
-			.iom_open = mock_lock_open,
-			.iom_fstat = mock_lock_fstat,
-			.iom_fchmod = mock_lock_fchmod,
-			.iom_flock = mock_lock_flock,
-		};
-
-		io_mock_register(&mock_io);
-
-		struct ipc_lock lock = LOCKFILE_INIT("firmware_utility_lock");
-		assert_int_equal(acquire_lock(&lock, 0), -1);
-#ifndef __ANDROID__
-		assert_int_equal(test_state.open_count, 1);
-#endif
-		assert_int_equal(test_state.fchmod_count, 0);
-		assert_int_equal(test_state.flock_count, 0);
-		assert_int_equal(lock.is_held, 0);
-		assert_int_equal(lock.fd, -1);
-	}
-}
-
-void file_lock_rejects_fstat_failure_test_success(void **state)
-{
-	(void)state;
-
-	struct file_lock_test_state test_state = {
-		.fstat_ret = -1,
-		.fstat_errno = EIO,
-	};
-	const struct io_mock mock_io = {
-		.state = &test_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-
-	io_mock_register(&mock_io);
-
-	struct ipc_lock lock = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock, 0), -1);
-#ifndef __ANDROID__
-	assert_int_equal(test_state.open_count, 1);
-#endif
-	assert_int_equal(test_state.fchmod_count, 0);
-	assert_int_equal(test_state.flock_count, 0);
-	assert_int_equal(lock.is_held, 0);
-	assert_int_equal(lock.fd, -1);
-}
-
-void file_lock_fallback_dir_test_success(void **state)
-{
-	(void)state;
-
-#ifdef __ANDROID__
-	skip();
-#else
-	struct stat dir_st = {0};
-	if (lstat("/run/lock", &dir_st) != 0 || !S_ISDIR(dir_st.st_mode))
-		skip();
-
-	/*
-	 * Case 1: /run/lock has no lockfile (ENOENT) and none can be created
-	 * (EACCES on O_CREAT | O_EXCL) -> falls back to /tmp.
-	 */
-	struct file_lock_test_state fallback_state = {
-		.open_script_len = 3,
-		.open_script_ret = { -1, -1, MOCK_FD },
-		.open_script_errno = { ENOENT, EACCES, 0 },
-		.fstat_ret = 0,
-		.fstat_buf = {
-			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
-			.st_uid = geteuid(),
-		},
-		.flock_ret = 0,
-	};
-	const struct io_mock fallback_mock = {
-		.state = &fallback_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-	io_mock_register(&fallback_mock);
-
-	struct ipc_lock lock1 = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock1, 0), 0);
-	assert_int_equal(fallback_state.open_count, 3);
-	assert_string_equal(fallback_state.open_path_history[0], "/run/lock/firmware_utility_lock");
-	assert_string_equal(fallback_state.open_path_history[1], "/run/lock/firmware_utility_lock");
-	assert_string_equal(fallback_state.open_path_history[2], "/tmp/firmware_utility_lock");
-	assert_int_equal(release_lock(&lock1), 0);
-
-	/*
-	 * Case 2: Existing entry in /run/lock fails open() (e.g. ELOOP or
-	 * EACCES) -> returns error without falling back to /tmp.
-	 */
-	struct file_lock_test_state no_fallback_state = {
-		.open_script_len = 1,
-		.open_script_ret = { -1 },
-		.open_script_errno = { ELOOP },
-	};
-	const struct io_mock no_fallback_mock = {
-		.state = &no_fallback_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-	io_mock_register(&no_fallback_mock);
-
-	struct ipc_lock lock2 = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock2, 0), -1);
-	assert_int_equal(no_fallback_state.open_count, 1);
-	assert_string_equal(no_fallback_state.open_path_history[0], "/run/lock/firmware_utility_lock");
-	assert_int_equal(lock2.fd, -1);
-
-	/*
-	 * Case 3: Concurrent creation in /run/lock (ENOENT -> EEXIST) followed
-	 * by open() failure -> returns error without falling back to /tmp.
-	 */
-	struct file_lock_test_state race_fail_state = {
-		.open_script_len = 3,
-		.open_script_ret = { -1, -1, -1 },
-		.open_script_errno = { ENOENT, EEXIST, EACCES },
-	};
-	const struct io_mock race_fail_mock = {
-		.state = &race_fail_state,
-		.iom_open = mock_lock_open,
-		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
-		.iom_flock = mock_lock_flock,
-	};
-	io_mock_register(&race_fail_mock);
-
-	struct ipc_lock lock3 = LOCKFILE_INIT("firmware_utility_lock");
-	assert_int_equal(acquire_lock(&lock3, 0), -1);
-	assert_int_equal(race_fail_state.open_count, 3);
-	assert_string_equal(race_fail_state.open_path_history[2], "/run/lock/firmware_utility_lock");
-	assert_int_equal(lock3.fd, -1);
-#endif
-}
-
-void file_lock_rejects_invalid_args_test_success(void **state)
-{
-	(void)state;
-
-	struct file_lock_test_state test_state = {0};
-	const struct io_mock mock_io = {
-		.state = &test_state,
-		.iom_open = mock_lock_open,
-	};
-	io_mock_register(&mock_io);
-
-	assert_int_equal(acquire_lock(NULL, 0), -1);
-	assert_int_equal(release_lock(NULL), -1);
-
-	struct ipc_lock null_name = LOCKFILE_INIT(NULL);
-	assert_int_equal(acquire_lock(&null_name, 0), -1);
-
-	struct ipc_lock empty_name = LOCKFILE_INIT("");
-	assert_int_equal(acquire_lock(&empty_name, 0), -1);
-	assert_int_equal(test_state.open_count, 0);
-
-	/* Filename longer than PATH_MAX must be rejected rather than truncated. */
-	char huge_name[PATH_MAX + 16];
-	memset(huge_name, 'a', sizeof(huge_name) - 1);
-	huge_name[sizeof(huge_name) - 1] = '\0';
-
-	struct ipc_lock huge_lock = LOCKFILE_INIT(huge_name);
-	assert_int_equal(acquire_lock(&huge_lock, 0), -1);
-	assert_int_equal(test_state.open_count, 0);
-	assert_int_equal(huge_lock.is_held, 0);
-	assert_int_equal(huge_lock.fd, -1);
 }
 
 void file_lock_timeout_reports_holder_test_success(void **state)
@@ -664,7 +265,6 @@ void file_lock_timeout_reports_holder_test_success(void **state)
 		.fstat_ret = 0,
 		.fstat_buf = {
 			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
 			.st_uid = geteuid(),
 			.st_dev = makedev(0x00, 0x1a),
 			.st_ino = 98765,
@@ -679,7 +279,6 @@ void file_lock_timeout_reports_holder_test_success(void **state)
 		.state = &test_state,
 		.iom_open = mock_lock_open,
 		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
 		.iom_flock = mock_lock_flock,
 		.iom_read = mock_lock_read,
 		.iom_fopen = mock_lock_fopen,
@@ -692,7 +291,6 @@ void file_lock_timeout_reports_holder_test_success(void **state)
 	struct ipc_lock lock = LOCKFILE_INIT("firmware_utility_lock");
 	assert_int_equal(acquire_lock(&lock, 0), -1);
 	assert_int_equal(lock.is_held, 0);
-	assert_int_equal(lock.fd, -1);
 
 	assert_int_equal(test_state.proc_locks_opened, 1);
 	assert_int_equal(test_state.proc_locks_closed, 1);
@@ -715,7 +313,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 		.fstat_ret = 0,
 		.fstat_buf = {
 			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
 			.st_uid = geteuid(),
 		},
 		.flock_ret = -1,
@@ -727,7 +324,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 		.state = &fallback_state,
 		.iom_open = mock_lock_open,
 		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
 		.iom_flock = mock_lock_flock,
 		.iom_read = mock_lock_read,
 		.iom_fopen = mock_lock_fopen,
@@ -738,7 +334,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 
 	struct ipc_lock lock1 = LOCKFILE_INIT("firmware_utility_lock");
 	assert_int_equal(acquire_lock(&lock1, 0), -1);
-	assert_int_equal(lock1.fd, -1);
 	assert_int_equal(fallback_state.read_count, 1);
 	assert_int_equal(fallback_state.unexpected_fopen_count, 0);
 
@@ -751,7 +346,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 		.fstat_ret = 0,
 		.fstat_buf = {
 			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
 			.st_uid = geteuid(),
 			.st_dev = makedev(0x00, 0x1a),
 			.st_ino = 98765,
@@ -765,7 +359,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 		.state = &ns_state,
 		.iom_open = mock_lock_open,
 		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
 		.iom_flock = mock_lock_flock,
 		.iom_read = mock_lock_read,
 		.iom_fopen = mock_lock_fopen,
@@ -776,7 +369,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 
 	struct ipc_lock lock2 = LOCKFILE_INIT("firmware_utility_lock");
 	assert_int_equal(acquire_lock(&lock2, 0), -1);
-	assert_int_equal(lock2.fd, -1);
 	assert_int_equal(ns_state.proc_locks_opened, 1);
 	assert_int_equal(ns_state.proc_locks_closed, 1);
 	assert_int_equal(ns_state.read_count, 1);
@@ -796,7 +388,6 @@ void file_lock_timeout_fallback_pid_test_success(void **state)
 		fallback_state.lockfile_read_data = invalid_pids[i];
 		struct ipc_lock bad_lock = LOCKFILE_INIT("firmware_utility_lock");
 		assert_int_equal(acquire_lock(&bad_lock, 0), -1);
-		assert_int_equal(bad_lock.fd, -1);
 		assert_int_equal(fallback_state.read_count, 1);
 		assert_int_equal(fallback_state.unexpected_fopen_count, 0);
 	}
@@ -814,7 +405,6 @@ void file_lock_timeout_edge_cases_test_success(void **state)
 		.fstat_ret = 0,
 		.fstat_buf = {
 			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
 			.st_uid = geteuid(),
 			.st_dev = makedev(0x00, 0x1a),
 			.st_ino = 98765,
@@ -827,7 +417,6 @@ void file_lock_timeout_edge_cases_test_success(void **state)
 		.state = &open_fail_state,
 		.iom_open = mock_lock_open,
 		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
 		.iom_flock = mock_lock_flock,
 		.iom_read = mock_lock_read,
 		.iom_fopen = mock_lock_fopen,
@@ -838,7 +427,6 @@ void file_lock_timeout_edge_cases_test_success(void **state)
 
 	struct ipc_lock lock1 = LOCKFILE_INIT("firmware_utility_lock");
 	assert_int_equal(acquire_lock(&lock1, 0), -1);
-	assert_int_equal(lock1.fd, -1);
 	assert_int_equal(open_fail_state.proc_locks_opened, 1);
 	assert_int_equal(open_fail_state.proc_locks_closed, 0);
 	assert_int_equal(open_fail_state.proc_comm_opened, 0);
@@ -850,7 +438,6 @@ void file_lock_timeout_edge_cases_test_success(void **state)
 		.fstat_ret = 0,
 		.fstat_buf = {
 			.st_mode = S_IFREG | 0666,
-			.st_nlink = 1,
 			.st_uid = geteuid(),
 			.st_dev = makedev(0x00, 0x1a),
 			.st_ino = 98765,
@@ -866,7 +453,6 @@ void file_lock_timeout_edge_cases_test_success(void **state)
 		.state = &edge_state,
 		.iom_open = mock_lock_open,
 		.iom_fstat = mock_lock_fstat,
-		.iom_fchmod = mock_lock_fchmod,
 		.iom_flock = mock_lock_flock,
 		.iom_read = mock_lock_read,
 		.iom_fopen = mock_lock_fopen,
@@ -877,7 +463,6 @@ void file_lock_timeout_edge_cases_test_success(void **state)
 
 	struct ipc_lock lock2 = LOCKFILE_INIT("firmware_utility_lock");
 	assert_int_equal(acquire_lock(&lock2, 0), -1);
-	assert_int_equal(lock2.fd, -1);
 	assert_int_equal(edge_state.proc_locks_opened, 1);
 	assert_int_equal(edge_state.proc_locks_closed, 1);
 	assert_int_equal(edge_state.proc_comm_opened, 1);

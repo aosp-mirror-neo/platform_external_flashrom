@@ -227,7 +227,6 @@ static int mock_fstat(int fd, void *buf)
 		struct stat *st = buf;
 		memset(st, 0, sizeof(*st));
 		st->st_mode = S_IFREG | 0666;
-		st->st_nlink = 1;
 #if !IS_WINDOWS
 		st->st_uid = geteuid();
 #endif
@@ -356,14 +355,6 @@ int __wrap_flock(int fd, int operation)
 	LOG_ME;
 	if (get_io() && get_io()->iom_flock)
 		return get_io()->iom_flock(get_io()->state, fd, operation);
-	return 0;
-}
-
-int __wrap_fchmod(int fd, mode_t mode)
-{
-	LOG_ME;
-	if (get_io() && get_io()->iom_fchmod)
-		return get_io()->iom_fchmod(get_io()->state, fd, mode);
 	return 0;
 }
 
@@ -572,13 +563,6 @@ int main(int argc, char *argv[])
 
 	const struct CMUnitTest file_lock_tests[] = {
 		cmocka_unit_test_teardown(file_lock_acquire_release_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_create_and_race_open_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_fchmod_ownership_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_rejects_non_regular_file_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_rejects_invalid_nlink_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_rejects_fstat_failure_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_fallback_dir_test_success, file_lock_test_teardown),
-		cmocka_unit_test_teardown(file_lock_rejects_invalid_args_test_success, file_lock_test_teardown),
 		cmocka_unit_test_teardown(file_lock_timeout_reports_holder_test_success, file_lock_test_teardown),
 		cmocka_unit_test_teardown(file_lock_timeout_fallback_pid_test_success, file_lock_test_teardown),
 		cmocka_unit_test_teardown(file_lock_timeout_edge_cases_test_success, file_lock_test_teardown),
